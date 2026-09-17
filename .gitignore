@@ -1,0 +1,7 @@
+# WorkBuddy 项目内部数据（含本地记忆），不纳入版本管理
+.workbuddy/
+
+# 操作系统 / 编辑器临时文件
+.DS_Store
+Thumbs.db
+*.tmp
