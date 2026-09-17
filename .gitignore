@@ -1,6 +1,9 @@
 # WorkBuddy 项目内部数据（含本地记忆），不纳入版本管理
 .workbuddy/
 
+# 调研报告（不纳入仓库）
+调研报告-开源生图工作台.md
+
 # 操作系统 / 编辑器临时文件
 .DS_Store
 Thumbs.db
