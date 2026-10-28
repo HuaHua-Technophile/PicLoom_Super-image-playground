@@ -1,10 +1,25 @@
 # WorkBuddy 项目内部数据（含本地记忆），不纳入版本管理
 .workbuddy/
 
-# 调研报告（不纳入仓库）
-调研报告-开源生图工作台.md
+# 技术调研、审计与决策资料（不纳入仓库）
+research/
+*调研报告-开源生图工作台.md
 
 # 操作系统 / 编辑器临时文件
 .DS_Store
 Thumbs.db
 *.tmp
+
+# Build output and local application data
+**/bin/
+**/obj/
+**/node_modules/
+src/PicLoom.Api/wwwroot/
+artifacts/
+TestResults/
+*.db
+*.db-shm
+*.db-wal
+*.user
+.env
+.env.*

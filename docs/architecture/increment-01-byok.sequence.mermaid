@@ -1,0 +1,175 @@
+%% PicLoom P0.5 关键时序（源：docs/architecture/increment-01-byok.md §6）
+%% 图 1：保存 BYOK（含换 origin 的密钥清理）
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant W as SettingsPage
+    participant A as Api (Endpoints)
+    participant S as ProviderSettingsService
+    participant P as ProviderUrl
+    participant D as PicLoomDbContext
+    participant K as ISecretStore (DPAPI)
+
+    U->>W: 填 Base URL / API Key / 模型名，点"保存"
+    W->>A: PUT /api/settings/provider {baseUrl, apiKey, model, enabled}
+    A->>S: UpsertAsync(input)
+    S->>P: Normalize(baseUrl)
+    alt 非法（非 https 且非 loopback / 含 userinfo、query、fragment、..）
+        P-->>S: throw invalid_base_url
+        S-->>A: DomainException
+        A-->>W: 400 {code:"invalid_base_url"}
+    else 合法
+        P-->>S: Base(去尾 /v1)、Origin
+        S->>D: 读 ProviderSettings(Protocol=openaiImages)
+        alt 无行 且 apiKey 为空
+            S-->>A: DomainException secret_required
+            A-->>W: 400 {code:"secret_required"}
+        else origin 变了 且 apiKey 为空
+            S-->>A: DomainException provider_key_required_for_new_origin
+            A-->>W: 400 {code:"provider_key_required_for_new_origin"}
+        else
+            alt apiKey 非空
+                S->>K: SaveAsync(newOrigin, apiKey)
+                opt KeyOrigin 非空且 != newOrigin
+                    S->>K: DeleteAsync(oldOrigin) （失败只记日志码）
+                end
+                S->>S: MaskedKey = (len>=12 ? "sk-…"+末4 : null), HasKey = true
+            else apiKey 为空（origin 未变）
+                Note over S: 保留旧密钥与旧掩码，只更新 URL/模型
+            end
+            S->>D: Upsert ProviderSettings + SaveChanges
+            S-->>A: ProviderSettingsView
+            A-->>W: 200 {configured:true, maskedKey:"sk-…a1b2"}
+        end
+    end
+    Note over W,A: 响应体永不含明文 Key（I4）
+
+%% 图 2：新建内联任务 + 挡位
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant W as TasksPage
+    participant T as resolutionTiers.ts
+    participant A as Api
+    participant S as PicLoomService
+    participant R as ResolutionSizing
+    participant G as IProviderRegistry
+    participant C as IProviderCredentials
+    participant D as PicLoomDbContext
+
+    U->>W: 输入提示词，点 2K + 16:9
+    W->>T: resolveTier("2K","16:9")
+    T-->>W: 2560×1440 → 显示"实际尺寸：2560 × 1440"
+    U->>W: 点"生成"
+    W->>W: 本地校验：提示词 1..8000（超限禁用按钮，AC-12）
+    W->>A: POST /api/tasks {prompt, resolution, groupId:null, provider, model}
+    A->>S: CreateTaskAsync(input)
+    S->>G: Find(provider)
+    alt provider 未知
+        S-->>A: DomainException unsupported_provider
+    end
+    opt provider 需要凭据
+        S->>C: ResolveAsync(provider)
+        alt 未配置 / 密钥不可读
+            S-->>A: DomainException provider_not_configured
+        end
+    end
+    S->>S: prompt 与 templateId 恰好一个？长度合法？
+    S->>R: TryResolveTier / ValidateCustom
+    alt 非法
+        S-->>A: DomainException resolution_*
+        A-->>W: 400 {code} → 就地提示，不建任务、不发请求（AC-8/9）
+    end
+    S->>R: ToSnapshot(target) → aspectClass 且带 2560×1440
+    S->>S: PromptSnapshot.Inline(body) → (Empty,0,"",body,inline)
+    S->>D: groupId 为空 → ReservedIds.UngroupedGroup（不查存在性）
+    S->>D: Add GenerationTask(Queued) + SaveChanges
+    S->>S: ITaskSignal.Wake()
+    S-->>A: GenerationTask
+    A-->>W: 202 Accepted + Location
+    W->>W: 列表顶部插入"排队中"，开始 1.5s 轮询至终态（AC-1）
+
+%% 图 3：Worker 派发到真实 Provider（错误归一化，绝不重发）
+sequenceDiagram
+    autonumber
+    participant WK as GenerationWorker
+    participant D as PicLoomDbContext
+    participant RG as ProviderRegistry
+    participant C as IProviderCredentials
+    participant P as OpenAiCompatibleImageProvider
+    participant PR as OpenAiCompatibleProtocol
+    participant IP as ImageProbe
+    participant UP as 上游 {base}/v1/images/generations
+
+    WK->>D: 取最早 Queued 任务
+    WK->>RG: Find(task.Provider)
+    alt 未知 provider
+        WK->>D: TransitionTo(Failed, "unsupported_provider")
+        Note over WK,UP: 未创建 Attempt，未发任何请求
+    else 已知
+        opt RequiresConnection
+            WK->>C: ResolveAsync(providerId)
+            alt 无凭据
+                WK->>D: TransitionTo(Failed, "provider_not_configured")
+                Note over WK,UP: 同上：零请求
+            end
+        end
+        WK->>D: 事务内 TransitionTo(Dispatching) + 新增 JobAttempt（唯一 attempt）
+        WK->>D: TransitionTo(Running) 落库
+        WK->>P: GenerateAsync(ProviderRequest{..., Connection})
+        P->>PR: BuildRequestBody → {model, prompt, n:1, size:"2560x1440"}
+        P->>UP: POST /v1/images/generations（Authorization, Idempotency-Key, 120s, 不跟随重定向）
+        alt 2xx 且 data[0].b64_json
+            UP-->>P: JSON（<=32MiB）
+            P->>P: base64 解码
+        else 2xx 且 data[0].url
+            UP-->>P: JSON（<=32MiB）
+            P->>UP: GET url（仅 https、非 loopback/私网、不跟随、<=32MiB、30s）
+        else 非 2xx
+            UP-->>P: status + body（仅读前 8KiB 做关键词匹配）
+            P->>PR: Classify(status, snippet)
+            PR-->>P: ProviderErrorKind
+            P-->>WK: throw ProviderFailureException(kind)
+        end
+        P->>IP: TryRead(bytes) → (w,h,mime)，PNG/JPEG/WebP 魔数
+        alt 魔数/尺寸不可识别
+            P-->>WK: throw ProviderFailureException(InvalidResponse)
+        end
+        P-->>WK: GeneratedImage(bytes, mime, w, h)
+        WK->>D: Asset 落盘 + Asset 行 + Succeeded（一次调用，AC-5 计数=1）
+    end
+
+    Note over WK,D: 任一异常分支 → PersistUnknownAsync(taskId, attemptId, code)
+    Note over WK,D: 状态仍为 Unknown；不回 Queued；不换模型重试；启动恢复仍把遗留 Dispatching/Running 转 Unknown
+
+%% 图 4：测试连接（三态，绝不调用生图接口）
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant W as SettingsPage
+    participant A as Api
+    participant S as ProviderSettingsService
+    participant K as ISecretStore
+    participant UP as 上游 {base}/v1/models
+
+    U->>W: 点"测试连接"
+    W->>A: POST /api/settings/provider/test {baseUrl?, apiKey?, model?}
+    A->>S: TestAsync(input)
+    S->>S: baseUrl 取 input 或已存值；apiKey 取 input 或 ReadAsync(origin)
+    alt 无 baseUrl
+        S-->>A: throw base_url_required
+        A-->>W: 400
+    end
+    S->>UP: GET /v1/models（Bearer, Accept: json, 总 5s, <=1MiB, 不跟随重定向）
+    alt 2xx 且可解析
+        S-->>A: {result:"ok", status:200}
+    else 401 / 403
+        S-->>A: {result:"unauthorized", status:401}
+    else 404 / 405 / 5xx / 非 JSON
+        S-->>A: {result:"unknown", status:404（真实状态码）}
+    else 连接失败 / DNS / 超时（未拿到响应）
+        S-->>A: {result:"unknown", status:null}
+    end
+    A-->>W: 200 {result, status}
+    Note over S,UP: 不写库、不建任务、不调用 /v1/images/generations、不产生计费（AC-11）
+    Note over A,W: result 为 ProviderTestOutcome 枚举（ok/unauthorized/unknown），status 可空

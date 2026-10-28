@@ -1,0 +1,204 @@
+%% PicLoom P0.5 类图（源：docs/architecture/increment-01-byok.md §5）
+classDiagram
+    direction LR
+
+    class IImageProvider {
+        <<interface>>
+        +string Id
+        +bool RequiresConnection
+        +GenerateAsync(ProviderRequest, CancellationToken) Task~GeneratedImage~
+    }
+    class IProviderRegistry {
+        <<interface>>
+        +IReadOnlyList~string~ Ids
+        +Find(string id) IImageProvider?
+    }
+    class IProviderCredentials {
+        <<interface>>
+        +ResolveAsync(string providerId, CancellationToken) Task~ProviderConnection?~
+    }
+    class IProviderSettingsService {
+        <<interface>>
+        +GetAsync(CancellationToken) Task~ProviderSettingsView~
+        +UpsertAsync(ProviderSettingsInput, CancellationToken) Task~ProviderSettingsView~
+        +ClearAsync(CancellationToken) Task
+        +TestAsync(ProviderSettingsInput?, CancellationToken) Task~ProviderTestResult~
+    }
+    class ISecretStore {
+        <<interface>>
+        +SaveAsync(string origin, string secret, CancellationToken) Task
+        +ReadAsync(string origin, CancellationToken) Task~string?~
+        +DeleteAsync(string origin, CancellationToken) Task
+    }
+    class IProviderTransport {
+        <<interface>>
+        +Create() HttpMessageHandler
+    }
+
+    class OpenAiCompatibleImageProvider {
+        +string Id = "openai-images"
+        +bool RequiresConnection = true
+        +GenerateAsync(ProviderRequest, CancellationToken) Task~GeneratedImage~
+    }
+    class OpenAiCompatibleProtocol {
+        <<static>>
+        +BuildRequestBody(ProviderRequest) string
+        +ParseImage(string json) RawImage
+        +Classify(int status, string bodySnippet) ProviderErrorKind
+    }
+    class ImageProbe {
+        <<static>>
+        +TryRead(byte[] bytes, out int w, out int h, out string mime) bool
+    }
+    class ProviderRegistry {
+        -Dictionary~string,IImageProvider~ _map
+        +Find(string id) IImageProvider?
+    }
+    class ProviderTransport {
+        +Create() HttpMessageHandler
+    }
+
+    class ProviderErrorKind {
+        <<enumeration>>
+        Unauthorized
+        ModelNotFound
+        SizeRejected
+        RateLimited
+        InsufficientQuota
+        Network
+        UpstreamError
+        InvalidResponse
+    }
+    class ProviderFailureException {
+        +ProviderErrorKind Kind
+        +string Code
+    }
+    class ProviderConnection {
+        +string BaseUrl
+        +string ApiKey
+    }
+
+    class GenerationTask {
+        +Guid Id
+        +Guid GroupId
+        +PromptSnapshot PromptSnapshot
+        +ResolutionSnapshot ResolutionSnapshot
+        +string Provider
+        +string Model
+        +GenerationStatus Status
+        +string? ErrorCode
+        +TransitionTo(GenerationStatus, string?)
+    }
+    class PromptSnapshot {
+        +Guid TemplateId
+        +int Revision
+        +string Name
+        +string Body
+        +PromptSource Source
+        +FromTemplate(PromptTemplate)$ PromptSnapshot
+        +Inline(string body)$ PromptSnapshot
+    }
+    class PromptSource {
+        <<enumeration>>
+        Template
+        Inline
+    }
+    class ResolutionSnapshot {
+        +Guid ProfileId
+        +string Name
+        +ResolutionMode Mode
+        +int? Width
+        +int? Height
+        +string? AspectRatio
+        +string? ImageSize
+    }
+    class ResolutionTarget {
+        +string? ImageSize
+        +string? AspectRatio
+        +int? Width
+        +int? Height
+    }
+    class ResolutionSizing {
+        <<static>>
+        +TryResolveTier(string?, string?, out int, out int) bool
+        +ValidateCustom(int?, int?) string?
+        +ToSnapshot(ResolutionTarget) ResolutionSnapshot
+        +SizeString(ResolutionSnapshot) string
+    }
+    class ProviderSettings {
+        +Guid Id
+        +ProviderProtocol Protocol
+        +string BaseUrl
+        +string Model
+        +string KeyOrigin
+        +string? MaskedKey
+        +bool HasKey
+        +bool IsEnabled
+        +Apply(string baseUrl, string model, bool enabled, string origin, string? masked, bool hasKey)
+    }
+    class ProviderSettingsService {
+        +GetAsync(CancellationToken) Task~ProviderSettingsView~
+        +UpsertAsync(ProviderSettingsInput, CancellationToken) Task~ProviderSettingsView~
+        +ClearAsync(CancellationToken) Task
+        +TestAsync(ProviderSettingsInput?, CancellationToken) Task~ProviderTestResult~
+        +ResolveAsync(string providerId, CancellationToken) Task~ProviderConnection?~
+    }
+    class ProviderUrl {
+        <<static>>
+        +Normalize(string baseUrl) NormalizedBase
+        +IsLoopback(Uri) bool
+        +IsRestrictedHost(Uri) bool
+    }
+    class PicLoomService {
+        +CreateTaskAsync(CreateTaskInput, CancellationToken) Task~GenerationTask~
+        +GetTasksAsync(Guid?, CancellationToken) Task~IReadOnlyList~
+        +GetGroupsAsync(CancellationToken) Task~IReadOnlyList~
+    }
+    class CreateTaskInput {
+        +Guid? TemplateId
+        +Guid? ResolutionId
+        +Guid? GroupId
+        +string? Provider
+        +string? Model
+        +string? Prompt
+        +ResolutionTarget? Resolution
+    }
+    class TaskGroup {
+        +Guid Id
+        +string Name
+        +bool IsSystem
+    }
+    class GenerationWorker {
+        -IProviderRegistry _registry
+        -ProcessNextAsync(CancellationToken) Task~bool~
+        -PersistUnknownAsync(Guid, Guid, string) Task
+    }
+
+    IImageProvider <|.. OpenAiCompatibleImageProvider
+    IProviderRegistry <|.. ProviderRegistry
+    IProviderCredentials <|.. ProviderSettingsService
+    IProviderSettingsService <|.. ProviderSettingsService
+    IProviderTransport <|.. ProviderTransport
+    ProviderRegistry o-- IImageProvider : 按 Id 索引
+    OpenAiCompatibleImageProvider ..> OpenAiCompatibleProtocol : 用
+    OpenAiCompatibleImageProvider ..> ImageProbe : 用
+    OpenAiCompatibleImageProvider ..> ProviderFailureException : 抛
+    ProviderFailureException --> ProviderErrorKind
+    OpenAiCompatibleProtocol ..> ProviderErrorKind : 判定
+    ProviderSettingsService ..> ISecretStore : 存/取/删密钥
+    ProviderSettingsService ..> ProviderUrl : 用
+    ProviderSettingsService ..> ProviderSettings : 读写
+    ProviderSettingsService ..> ProviderConnection : 产出
+    GenerationWorker ..> IProviderRegistry : 解析
+    GenerationWorker ..> IProviderCredentials : 派发前取凭据
+    GenerationWorker ..> GenerationTask : 状态机推进
+    PicLoomService ..> CreateTaskInput : 入参
+    PicLoomService ..> ResolutionSizing : 校验/构造
+    PicLoomService ..> PromptSource : 决定来源
+    PicLoomService ..> IProviderRegistry : provider 白名单
+    PicLoomService ..> TaskGroup : 系统分组兜底
+    GenerationTask *-- PromptSnapshot
+    GenerationTask *-- ResolutionSnapshot
+    PromptSnapshot --> PromptSource
+    ResolutionTarget --> ResolutionSizing
+    ProviderConnection --> OpenAiCompatibleImageProvider : 经 ProviderRequest 传入
